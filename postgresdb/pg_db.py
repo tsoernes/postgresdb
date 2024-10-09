@@ -19,13 +19,13 @@ from betterpathlib import Path
 from dotenv import load_dotenv
 from psycopg2 import sql
 from psycopg2.errors import UndefinedTable
-from psycopg2.extras import Json, execute_batch
+from psycopg2.extensions import connection, cursor
+from psycopg2.extras import DictCursor, Json, execute_batch
 from tabulate import tabulate
 
 from postgresdb.utils.itertoolz import (chunks, filter_di_vals, lmap,
                                         sub_dict_inv, valuemap_dict)
-from postgresdb.utils.misc import (confirm_action, git_root,
-                                   notify_when_finished)
+from postgresdb.utils.misc import confirm_action, git_root
 from postgresdb.utils.parse import blank_str_to_nan, nan_to_none
 
 PathOrStr = Path | str
@@ -51,51 +51,74 @@ psycopg2.extensions.register_adapter(np.bool_, psycopg2.extensions.AsIs)
 SqlConstant = Enum("SqlConstant", "NOW DEFAULT")
 
 
-class Db:
+class PgDb:
     conns = {
         "local": {
-            "host": os.environ["DB_HOST"],
-            "dbname": os.environ["DB_NAME"],
-            "port": os.environ["DB_PORT"],
-            "user": os.environ["DB_USER"],
-            "password": os.environ["DB_PASSWORD"],
+            "host": os.environ.get("DB_HOST"),
+            "dbname": os.environ.get("DB_NAME"),
+            "port": os.environ.get("DB_PORT"),
+            "user": os.environ.get("DB_USER"),
+            "password": os.environ.get("DB_PASSWORD"),
         }
     }
 
-    def __init__(self, *args, **kwargs):
-        """
-        Passes arguments and keyword arguments to `psycopg2.connect`
+    def __init__(
+        self, conn_name: Optional[str] = None, **connection_params: str
+    ) -> None:
+        """Initialize database connection.
+
+        Args:
+            conn_name: Name of predefined connection from self.conns
+            **connection_params: Direct connection parameters (host, dbname, etc.)
         """
         load_dotenv()
         self.conn_key = ""
-        if not args and not kwargs:
-            kwargs = self.conns["local"]
+
+        # Determine connection parameters
+        if not conn_name and not connection_params:
+            connection_params = self.conns["local"]
             self.conn_key = "local"
-        elif args and args[0] in self.conns:
-            kwargs = self.conns[args[0]]
-            self.conn_key = args[0]
-            args = ()
+        elif conn_name and conn_name in self.conns:
+            connection_params = self.conns[conn_name]
+            self.conn_key = conn_name
 
-        self.conn = psycopg2.connect(*args, **kwargs)
-        self.cursor = self.conn.cursor()
-        self.di_cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        if not connection_params or not connection_params.get("host"):
+            raise ValueError("No connection params")
 
-        self.host = self.conn.info.host
-        self.port = self.conn.info.port
-        self.dbname = self.conn.info.dbname
-        self.user = self.conn.info.user
-        self.password = self.conn.info.password
+        # Establish connection
+        self.conn: connection = psycopg2.connect(**connection_params)
+        self.cursor: cursor = self.conn.cursor()
+        self.dict_cursor: DictCursor = self.conn.cursor(
+            cursor_factory=psycopg2.extras.DictCursor
+        )
+
+        # Store connection info
+        conn_info = self.conn.info
+        self.host: str = conn_info.host
+        self.port: int = int(conn_info.port)
+        self.dbname: str = conn_info.dbname
+        self.user: str = conn_info.user
+        self.password: str = conn_info.password
+
         logging.info(f"Connected to database {self.dbname} at host {self.host}")
-        if "aws_main" in self.conn_key:
+
+        # Enable read-only mode for AWS main connections
+        if "main" in self.conn_key or "prod" in self.conn_key:
             self.set_readonly()
-            logging.info(f"Auto-enabling read-only mode")
+            logging.info("Auto-enabling read-only mode")
 
     def __repr__(self) -> str:
+        """Return string representation of database connection."""
         if self.conn_key:
             return f"{self.__class__.__name__}({repr(self.conn_key)})"
+
         return (
-            f"{self.__class__.__name__}(host={repr(self.host)}, port={repr(self.port)} "
-            f"dbname={repr(self.dbname)}, user={repr(self.user)}, password={repr(self.password)})"
+            f"{self.__class__.__name__}("
+            f"host={repr(self.host)}, "
+            f"port={repr(self.port)}, "
+            f"dbname={repr(self.dbname)}, "
+            f"user={repr(self.user)}, "
+            f"password={repr(self.password)})"
         )
 
     def reopen(self) -> None:
@@ -114,12 +137,19 @@ class Db:
         self.cursor.close()
         self.conn.close()
 
-    def as_readonly(self, value=True):
+    @property
+    def readonly(self) -> bool:
+        """Return True if connection is in read-only mode."""
+        if self.conn.readonly is None:
+            return False
+        return self.conn.readonly
+
+    def as_readonly(self, value: bool = True) -> "PgDb":
         self.conn.commit()
         self.conn.readonly = value
         return self
 
-    def set_readonly(self, value=True) -> None:
+    def set_readonly(self, value: bool = True) -> None:
         self.conn.commit()
         self.conn.readonly = value
 
@@ -526,11 +556,14 @@ class Db:
             ).format(column=sql.Identifier(column_name), table=sql.Identifier(table))
             self.cursor.execute(query)
             first_non_null_value = self.cursor.fetchone()
-            first_non_null_value = first_non_null_value[0] if first_non_null_value else None
+            first_non_null_value = (
+                first_non_null_value[0] if first_non_null_value else None
+            )
             results.append((column_name, column[1], column[2], first_non_null_value))
 
         table_schema = pd.DataFrame(
-            results, columns=["column_name", "data_type", "is_nullable", "example_value"]
+            results,
+            columns=["column_name", "data_type", "is_nullable", "example_value"],
         )
         return table_schema
 
@@ -795,7 +828,6 @@ class Db:
         print(f"Backed up database {self.dbname} at host {self.host} to {db_path}")
         return Path(db_path)
 
-    @notify_when_finished
     @_check_readonly
     def restore_from_file(
         self,

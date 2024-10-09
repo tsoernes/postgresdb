@@ -6,19 +6,18 @@ from betterpathlib import Path
 
 def git_root() -> Path:
     try:
-        return Path(__file__).parent.parent.parent
+        current = Path(__file__).parent
     except NameError:
         # Running in REPL, where __file__ is not defined.
-        # Pray that one of the modules are installed.
-        ex = None
-        for module in ("ftools", "sheets", "catml"):
-            try:
-                mod = importlib.import_module(module)
-                # return Path(mod.__path__._path[0]).parent.parent
-                return Path(mod.__path__[0]).parent.parent
-            except ModuleNotFoundError as e:
-                ex = e
-        raise ex from ex
+        current = Path.cwd()
+
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            raise ValueError("Reached root, could not find '.git' folder")
+        current = parent
 
 
 def confirm_action(

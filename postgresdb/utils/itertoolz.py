@@ -1,5 +1,5 @@
 from itertools import islice
-from typing import Callable, Dict, Iterable, List, TypeVar
+from typing import Callable, Iterable, TypeVar
 
 from postgresdb.utils.functoolz import curried
 
@@ -10,13 +10,14 @@ W = TypeVar("W")
 
 
 @curried
-def lmap(fn: Callable[[V], W], iterable: Iterable[V]) -> List[W]:
+def lmap(fn: Callable[[V], W], iterable: Iterable[V]) -> list[W]:
     """Map which returns a list"""
     return [fn(x) for x in iterable]
 
 
 @curried
-def chunks(iterable: Iterable, size: int):
+def chunks(iterable: Iterable[K], size: int) -> Iterable[list[K]]:
+    """Yield successive chunks of a specified size from the iterable."""
     it = iter(iterable)
     item = list(islice(it, size))
     while item:
@@ -25,14 +26,14 @@ def chunks(iterable: Iterable, size: int):
 
 
 @curried
-def filter_di_vals(pred: Callable[[V], bool], di: Dict[K, V]) -> Dict[K, V]:
+def filter_di_vals(pred: Callable[[V], bool], di: dict[K, V]) -> dict[K, V]:
     """Filter a dictionary by a predicate on its values."""
     return {k: v for k, v in di.items() if pred(v)}
 
 
 @curried
-def valuemap_dict(fn: Callable[[V], W], di: Dict[K, V]) -> Dict[K, W]:
-    """Map `fn` over each value in the dict"""
+def valuemap_dict(fn: Callable[[V], W], di: dict[K, V]) -> dict[K, W]:
+    """Map a function over each value in the dict"""
     return {k: fn(v) for k, v in di.items()}
 
 

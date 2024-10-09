@@ -36,6 +36,8 @@ def blank_str_to_nan(
 
 def nan_to_none(val) -> Any:
     """
+    Convert NaN values to None.
+
     >>> nan_to_none(np.nan) is None
     True
     >>> nan_to_none(pd.NA) is None
@@ -47,11 +49,6 @@ def nan_to_none(val) -> Any:
     >>> nan_to_none([]) == []
     True
     """
-    if (
-        not isinstance(val, Collection)
-        and not isinstance(val, pd.Series)
-        and not isinstance(val, pd.DataFrame)
-        and pd.isna(val)
-    ):
+    if not isinstance(val, (Collection, pd.Series, pd.DataFrame)) and pd.isna(val):
         return None
     return val
