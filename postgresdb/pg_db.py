@@ -20,8 +20,7 @@ from dotenv import load_dotenv
 from psycopg2 import sql
 from psycopg2.errors import UndefinedTable
 from psycopg2.extensions import connection, cursor
-from psycopg2.extras import DictCursor, Json, execute_batch
-from tabulate import tabulate
+from psycopg2.extras import DictCursor, Json, RealDictCursor, execute_batch
 
 from postgresdb.utils.itertoolz import (chunks, filter_di_vals, lmap,
                                         sub_dict_inv, valuemap_dict)
@@ -34,7 +33,7 @@ PathOrStr = Path | str
 def psycopg2_nan_to_null(
     f,
     _NULL=psycopg2.extensions.AsIs("NULL"),
-    _NaN=np.NaN,
+    _NaN=np.nan,
     _Float=psycopg2.extensions.Float,
 ):
     """Auto convert NaN values to NULL upon insertion"""
@@ -71,7 +70,7 @@ class PgDb:
             conn_name: Name of predefined connection from self.conns
             **connection_params: Direct connection parameters (host, dbname, etc.)
         """
-        load_dotenv()
+        # load_dotenv()
         self.conn_key = ""
 
         # Determine connection parameters
@@ -88,19 +87,25 @@ class PgDb:
         # Establish connection
         self.conn: connection = psycopg2.connect(**connection_params)
         self.cursor: cursor = self.conn.cursor()
-        self.dict_cursor: DictCursor = self.conn.cursor(
+        self.di_cursor: DictCursor = self.conn.cursor(
             cursor_factory=psycopg2.extras.DictCursor
+        )
+        self.rdi_cursor: RealDictCursor = self.conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
         )
 
         # Store connection info
         conn_info = self.conn.info
         self.host: str = conn_info.host
-        self.port: int = int(conn_info.port)
+        self.port: str = conn_info.port
         self.dbname: str = conn_info.dbname
         self.user: str = conn_info.user
         self.password: str = conn_info.password
 
-        logging.info(f"Connected to database {self.dbname} at host {self.host}")
+        version = self.fetch_val("SELECT version();")
+        logging.info(
+            f"Connected to database {self.dbname} at host {self.host}\n{version}"
+        )
 
         # Enable read-only mode for AWS main connections
         if "main" in self.conn_key or "prod" in self.conn_key:
@@ -132,6 +137,9 @@ class PgDb:
         )
         self.cursor = self.conn.cursor()
         self.di_cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        self.rdi_cursor = self.conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
 
     def close(self) -> None:
         self.cursor.close()
@@ -204,9 +212,10 @@ class PgDb:
         """
         self.cursor.execute("rollback")
 
-    def fetch_val(self, statement: str = "", vals=None) -> Any:
+    def fetch_val(self, statement: sql.SQL | str = "", vals=None) -> Any:
         if statement:
-            statement = statement.replace('"', "'")
+            if isinstance(statement, str):
+                statement = statement.replace('"', "'")
             self.cursor.execute(statement, vals)
         res = self.cursor.fetchone()
         if res:
@@ -218,7 +227,7 @@ class PgDb:
             self.cursor.execute(statement, vals)
         return self.cursor.fetchall()
 
-    def fetch_count(self, statement: str = "", vals=None) -> List:
+    def fetch_count(self, statement: str = "", vals=None) -> int:
         """Return the number of values returned"""
         if statement:
             self.cursor.execute(statement, vals)
@@ -399,6 +408,24 @@ class PgDb:
         return ids
 
     @_check_readonly
+    def insert_dataframe_alchemy(self, df, **to_sql_kwargs) -> None:
+        """
+        Insert a dataframe using SQL alchemy.
+
+        `to_sql_kwargs` are passed to pandas.DataFrame.to_sql
+        """
+        from sqlalchemy import create_engine
+
+        engine = create_engine(
+            f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}/{self.dbname}"
+        )
+
+        df.to_sql(
+            con=engine,
+            **to_sql_kwargs,
+        )
+
+    @_check_readonly
     def insert_dataclass(
         self,
         dclass,
@@ -428,7 +455,7 @@ class PgDb:
         replace_nan_with_none=True,
         update_func=None,
         updated_at_col="updated_at",
-    ) -> List[int]:
+    ):
         """
         Update rows in `table`.
 
@@ -441,7 +468,7 @@ class PgDb:
         if update_func not in (None, "only_fill", "concat"):
             raise ValueError(update_func)
         if not dicts:
-            return []
+            return None
         if replace_nan_with_none:
             dicts = lmap(valuemap_dict(nan_to_none), dicts)
         dicts = tuple(dicts)
@@ -518,54 +545,51 @@ class PgDb:
             counts[tbl] = self.row_count(tbl)
         return counts
 
-    def get_table_info(self, table: str) -> List[Dict]:
+    def set_comment(self, table, column, comment) -> None:
+        """Set a column comment"""
+        statement = f"""
+            COMMENT ON COLUMN {table}."{column}" IS '{comment}';
+        """
+        self.cursor.execute(statement)
+
+    def get_table_info(
+        self, table: str, include_first_non_null_value: bool = True
+    ) -> List[Dict]:
         """
         Get information about a table.
         """
-        self.di_cursor.execute(
+        self.rdi_cursor.execute(
             """
-        SELECT column_name, data_type, is_nullable, column_default
-        FROM information_schema.columns
-        WHERE table_name=%s
-        ORDER BY ordinal_position
+        SELECT
+            a.attname AS column_name,
+            format_type(a.atttypid, a.atttypmod) AS data_type,
+            CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+            pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+            d.description AS column_comment
+        FROM
+            pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            LEFT JOIN pg_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum
+            LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+        WHERE
+            c.relname = %s AND a.attnum > 0
+        ORDER BY
+            a.attnum;
         """,
             (table,),
         )
-        tbl_schema = self.di_cursor.fetchall()
+        tbl_schema = self.rdi_cursor.fetchall()
+
+        if include_first_non_null_value:
+            for column in tbl_schema:
+                column_name = column["column_name"]
+                query = sql.SQL(
+                    "SELECT {column} FROM {table} WHERE {column} IS NOT NULL LIMIT 1"
+                ).format(
+                    column=sql.Identifier(column_name), table=sql.Identifier(table)
+                )
+                column["first_non_null_value"] = self.fetch_val(query)
         return tbl_schema
-
-    def get_table_info2(self, table) -> list:
-        # Get the column names
-        self.cursor.execute(
-            f"""
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = '{table}';
-        """
-        )
-        columns = self.cursor.fetchall()
-
-        # Prepare the results list
-        results = []
-
-        # Fetch the first non-null value for each column
-        for column in columns:
-            column_name = column[0]
-            query = sql.SQL(
-                "SELECT {column} FROM {table} WHERE {column} IS NOT NULL LIMIT 1"
-            ).format(column=sql.Identifier(column_name), table=sql.Identifier(table))
-            self.cursor.execute(query)
-            first_non_null_value = self.cursor.fetchone()
-            first_non_null_value = (
-                first_non_null_value[0] if first_non_null_value else None
-            )
-            results.append((column_name, column[1], column[2], first_non_null_value))
-
-        table_schema = pd.DataFrame(
-            results,
-            columns=["column_name", "data_type", "is_nullable", "example_value"],
-        )
-        return table_schema
 
     def get_columns_info(
         self, table: str, data_types: Union[str, Collection[str]] = ()
@@ -593,6 +617,8 @@ class PgDb:
         """
         Print information about a table, or about all tables if no table is specified.
         """
+        from tabulate import tabulate
+
         if not tables:
             tables = self.list_tables(schema)
         elif isinstance(tables, str):
@@ -621,6 +647,8 @@ class PgDb:
         """
         Print information about a table, or about all tables if no table is specified.
         """
+        from tabulate import tabulate
+
         headers = ["col", "type", "nullable", "default"]
         if with_example:
             headers.append("example")
@@ -903,7 +931,7 @@ def table_from_dataclass(dataclass):
     return f"CREATE TABLE {name}\n" "" + "\n".join(cols)
 
 
-def db_or_conn(args: Union[str, Collection[str]] = "db", db_class=Db):
+def db_or_conn(args: Union[str, Collection[str]] = "db", db_class=PgDb):
     """
     A decorater that automatically opens and closes a database if the value of `arg`
     is a connection string or dict, else just passes along the database as is.
@@ -923,7 +951,7 @@ def db_or_conn(args: Union[str, Collection[str]] = "db", db_class=Db):
             bind.apply_defaults()
             opened = [False] * len(args)
             for i, arg in enumerate(args):
-                if not isinstance(bind.arguments[arg], Db):
+                if not isinstance(bind.arguments[arg], PgDb):
                     db = db_class(bind.arguments[arg])
                     bind.arguments[arg] = db
                     opened[i] = True
