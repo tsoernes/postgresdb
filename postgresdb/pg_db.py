@@ -249,7 +249,8 @@ class PgDb:
     def fetch_df(self, statement: str = "", vals=None) -> Optional[pd.DataFrame]:
         """Fetch all results from di_cursor and put them in a DataFrame"""
         if statement:
-            statement = statement.replace('"', "'")
+            if isinstance(statement, str):
+                statement = statement.replace('"', "'")
             self.di_cursor.execute(statement, vals)
         res = self.di_cursor.fetchall()
         if res:
@@ -408,22 +409,58 @@ class PgDb:
         return ids
 
     @_check_readonly
-    def insert_dataframe_alchemy(self, df, **to_sql_kwargs) -> None:
+    def insert_dataframe_alchemy(
+        self, df, table_name: str, if_exists="fail", **to_sql_kwargs
+    ) -> None:
         """
-        Insert a dataframe using SQL alchemy.
+        Insert a dataframe (pd.Series | pd.DataFrame | pl.DataFrame) using SQL alchemy.
 
         `to_sql_kwargs` are passed to pandas.DataFrame.to_sql
         """
+        if isinstance(df, (pd.DataFrame, pd.Series)):
+            df.to_sql(
+                con=self.get_sql_alchemy_engine(),
+                name=table_name,
+                if_exists=if_exists,
+                **to_sql_kwargs,
+            )
+        else:
+            import polars as pl
+            import polars.selectors as cs
+
+            if isinstance(df, pl.DataFrame):
+                con_str = f"postgresql://{self.user}:{self.password}@{self.host}/{self.dbname}"
+                dtype_map = {
+                    pl.UInt32: pl.Int64,
+                    pl.UInt16: pl.Int32,
+                }
+                for from_dtype, to_dtype in dtype_map.items():
+                    with_from_dtype = df.select(cs.by_dtype(from_dtype))
+                    if not with_from_dtype.is_empty():
+                        print(
+                            f"Warning. dtype={from_dtype} not supported. Casting to {to_dtype}"
+                        )
+                        df = df.with_columns(with_from_dtype.cast(to_dtype))
+
+                # Using adbc is much faster than sqlalchemy
+                df.write_database(
+                    table_name=table_name,
+                    connection=con_str,
+                    if_table_exists=if_exists,
+                    engine="adbc",
+                    engine_options=to_sql_kwargs,
+                )
+            else:
+                raise TypeError(f"Unsupported {type(df)=}")
+
+    def get_sql_alchemy_engine(self):
+        """Create SQLAlchemy engine for table operations"""
         from sqlalchemy import create_engine
 
-        engine = create_engine(
-            f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}/{self.dbname}"
-        )
-
-        df.to_sql(
-            con=engine,
-            **to_sql_kwargs,
-        )
+        # Create SQLAlchemy engine for table operations
+        con_str = f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}/{self.dbname}"
+        engine = create_engine(con_str)
+        return engine
 
     @_check_readonly
     def insert_dataclass(
